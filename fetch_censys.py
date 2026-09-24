@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract hostnames from one Censys search page (Web Properties and Hosts).
+"""Extract IPs or hostnames shown in Censys result titles (Web Properties and Hosts).
 
 Offline: python fetch_censys.py --html /tmp/saved.html
 Online:  python fetch_censys.py --fetch --headed
@@ -8,8 +8,8 @@ Requires beautifulsoup4; --fetch also requires playwright and its Chromium:
     python -m pip install beautifulsoup4 playwright
     python -m playwright install chromium
 No pagination or retries. Existing cached HTML is reused unless --refresh is set.
-Extracts Web Property titles and Host DNS rows. Excludes IP addresses and
-certificate/Matched Fields snippets, which can contain truncated text.
+Keeps IPv4/IPv6 titles instead of DNS aliases; hostname titles remain hostnames.
+Excludes certificate/Matched Fields snippets, which can contain truncated text.
 """
 
 import argparse
@@ -67,7 +67,7 @@ def normalize_hostname(value: str) -> str | None:
 
 
 def parse_hostnames(html: str, *, final_url: str = "", domain: str | None = None) -> list[str]:
-    """Parse observed Web Property titles and Host DNS rows, deduplicating names.
+    """Return deduplicated title IPs/hostnames (legacy function name retained).
 
     Supply final_url when parsing externally saved HTML: HTML alone cannot
     establish whether an HTTP or JavaScript navigation occurred.
@@ -111,23 +111,31 @@ def parse_hostnames(html: str, *, final_url: str = "", domain: str | None = None
             if not path.startswith(("/web/", "/hosts/")):
                 raise CensysError("Unrecognized result-title URL.")
             candidate = path.split("/", 2)[2].split("/", 1)[0]
-            if candidate.count(":") == 1:
+            bracketed = re.fullmatch(r"\[([^\]]+)\](?::\d+)?", candidate)
+            if bracketed:
+                candidate = bracketed.group(1)
+            elif candidate.count(":") == 1:
                 candidate = candidate.rsplit(":", 1)[0]
         candidates.append(candidate)
     for link in host_links:
-        # Hosts have IP-only titles and a separate DNS row in the same header.
-        # Match the semantic CSS prefix, not the generated hash suffix.
-        header = link.find_parent('div', class_=re.compile(r'^_content_'))
-        if header is not None:
-            for row in header.select('[class*="_countRow_"]'):
-                candidates.extend(re.split(r"[\s,]+", row.get_text(" ", strip=True)))
+        # Keep the displayed IP, even when a DNS alias appears below the title.
+        candidates.append(link.find('h2').get_text("", strip=True))
 
-    hostnames: dict[str, None] = {}
+    identifiers: dict[str, None] = {}
     for candidate in candidates:
+        try:
+            address = str(ipaddress.ip_address(candidate.strip().strip("[]")))
+        except ValueError:
+            pass
+        else:
+            # A domain filter applies only to hostname titles, never DNS aliases.
+            if domain is None:
+                identifiers[address] = None
+            continue
         hostname = normalize_hostname(candidate)
         if hostname and (domain is None or hostname == domain or hostname.endswith("." + domain)):
-            hostnames[hostname] = None
-    return list(hostnames)
+            identifiers[hostname] = None
+    return list(identifiers)
 
 
 def fetch_html(query: str, cache_dir: Path, *, refresh: bool = False, headed: bool = False) -> tuple[str, str]:
@@ -226,7 +234,7 @@ def main() -> int:
     source.add_argument("--html", type=Path, help="Parse saved HTML; no network access")
     source.add_argument("--fetch", action="store_true", help="Use cache or fetch one search page")
     parser.add_argument("--query", default=DEFAULT_QUERY)
-    parser.add_argument("--domain", help="Only this domain and its subdomains")
+    parser.add_argument("--domain", help="Only this domain and its subdomains; excludes IPs")
     parser.add_argument("--final-url", default="", help="Final URL associated with --html (for redirect checks)")
     parser.add_argument("--cache-dir", type=Path, default=Path("/tmp/censys-search"))
     parser.add_argument("--refresh", action="store_true", help="Explicitly spend quota to replace a cached page")
@@ -239,8 +247,8 @@ def main() -> int:
             html, final_url = args.html.read_text(encoding="utf-8"), args.final_url
         else:
             html, final_url = fetch_html(args.query, args.cache_dir, refresh=args.refresh, headed=args.headed)
-        for hostname in parse_hostnames(html, final_url=final_url, domain=args.domain):
-            print(hostname)
+        for identifier in parse_hostnames(html, final_url=final_url, domain=args.domain):
+            print(identifier)
         return 0
     except (CensysError, OSError, ValueError, ImportError) as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
