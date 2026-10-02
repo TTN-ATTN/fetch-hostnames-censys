@@ -6,12 +6,15 @@ Script Python dùng **BeautifulSoup** để lấy IP hoặc hostname hiển th�
 
 Script hỗ trợ kết quả **Web Property** và **Host**, giữ IPv4/IPv6 khi tiêu đề hiển thị IP, chuẩn hóa hostname và bỏ trùng. Không dùng Censys API và không yêu cầu API key; khả năng tìm kiếm vẫn phụ thuộc quyền truy cập và quota mà Censys áp dụng cho phiên trình duyệt.
 
+`validate_censys_ips.py` giúp kiểm tra các IP ứng viên với một hostname qua HTTPS sau khi có kết quả.
+
 ## Requirements và cài đặt
 
 - Python **3.10 trở lên**; đã chạy kiểm tra với Python 3.12.
 - `beautifulsoup4`: bắt buộc cho cả hai chế độ.
 - `playwright` và browser Chromium tương ứng: cần khi `--fetch` không có cache để dùng lại.
 - Chế độ `--headed` cần môi trường hiển thị đồ họa, chẳng hạn desktop Linux hoặc WSL có WSLg.
+- `validate_censys_ips.py` chỉ dùng thư viện chuẩn Python, không cần cài thêm package.
 
 Clone repo và tạo môi trường riêng:
 
@@ -38,16 +41,21 @@ python -m pip install beautifulsoup4
 
 ```text
 $ python fetch_censys.py --help
-usage: fetch_censys.py [-h] (--html HTML | --fetch) [--query QUERY] [--domain DOMAIN]
-                       [--final-url FINAL_URL] [--cache-dir CACHE_DIR] [--refresh] [--headed]
+usage: fetch_censys.py [-h] (--html HTML | --fetch) [--query QUERY]
+                       [--domain DOMAIN] [--final-url FINAL_URL]
+                       [--cache-dir CACHE_DIR] [--refresh]
+                       [--chromium-path CHROMIUM_PATH] [--headed]
 
-Extract IPs or hostnames shown in Censys result titles (Web Properties and Hosts). Offline: python
-fetch_censys.py --html /tmp/saved.html Online: python fetch_censys.py --fetch --headed Requires
-beautifulsoup4; --fetch also requires playwright and its Chromium: python -m pip install
-beautifulsoup4 playwright python -m playwright install chromium No pagination or retries. Existing
-cached HTML is reused unless --refresh is set. Keeps IPv4/IPv6 titles instead of DNS aliases;
-hostname titles remain hostnames. Excludes certificate/Matched Fields snippets, which can contain
-truncated text.
+Extract IPs or hostnames shown in Censys result titles (Web Properties and
+Hosts). Offline: python fetch_censys.py --html /tmp/saved.html Online: python
+fetch_censys.py --fetch --headed Requires beautifulsoup4; --fetch also
+requires playwright and its Chromium: python -m pip install beautifulsoup4
+playwright python -m playwright install chromium No pagination or retries.
+Existing cached HTML is reused unless --refresh is set. Keeps IPv4/IPv6 titles
+instead of DNS aliases; hostname titles remain hostnames. With --headed,
+pauses for manual confirmation when a Cloudflare challenge appears. Use
+--chromium-path to select an installed Chromium executable. Excludes
+certificate/Matched Fields snippets, which can contain truncated text.
 
 options:
   -h, --help            show this help message and exit
@@ -59,7 +67,17 @@ options:
                         Final URL associated with --html (for redirect checks)
   --cache-dir CACHE_DIR
   --refresh             Explicitly spend quota to replace a cached page
-  --headed              Show Chromium when fetching
+  --chromium-path CHROMIUM_PATH
+                        Use this installed Chromium executable instead of
+                        Playwright's bundled browser
+  --headed              Show Chromium; wait for manual Cloudflare CAPTCHA
+                        confirmation if needed
+```
+
+Script validate IP có manual riêng:
+
+```bash
+python validate_censys_ips.py --help
 ```
 
 ### Quick start
@@ -76,6 +94,13 @@ Tải một trang kết quả với cửa sổ browser, hoặc dùng lại cache
 python fetch_censys.py --fetch --headed --query 'example.com'
 ```
 
+Nếu xuất hiện CAPTCHA của Cloudflare, hãy giải trong Chromium rồi nhấn Enter ở terminal. Script chờ
+kết quả mà không tải lại trang. Chế độ headless không dừng để chờ xác nhận thủ công.
+
+Để chọn executable Chromium cài riêng, truyền đường dẫn bằng `--chromium-path`, ví dụ
+`--chromium-path /usr/bin/chromium`. Nếu không truyền tùy chọn này, script dùng browser Playwright
+đã tải về.
+
 Truyền trực tiếp chuỗi truy vấn Censys khi cần tìm cụ thể hơn:
 
 ```bash
@@ -91,11 +116,29 @@ python fetch_censys.py --html /tmp/censys-results.html --domain example.com
 
 Cache mặc định ở `/tmp/censys-search`; dùng `--cache-dir` để đổi vị trí. Chỉ thêm `--refresh` khi muốn tải lại và chấp nhận có thể tốn thêm quota. Bỏ `--headed` để chạy headless.
 
+Lưu mỗi IP ứng viên trên một dòng trong `ips.txt`, rồi kiểm tra chúng với hostname muốn xác minh:
+
+```bash
+python validate_censys_ips.py --domain example.com \
+  --output results/ip-validation.csv ips.txt
+```
+
+Validator kết nối tới mỗi IP trên cổng 443, đặt TLS SNI và HTTP Host theo `--domain`, kiểm tra
+certificate rồi gửi một request `HEAD /` nếu TLS hợp lệ. Kết quả gồm HTTP status, tên trên
+certificate, header server và địa chỉ redirect; không tải body hay đi theo redirect. Các request
+chạy tuần tự, mặc định cách nhau tối thiểu một giây và không retry. IP không hợp lệ hoặc không
+định tuyến toàn cầu bị loại; IP trùng bị bỏ qua. Có thể đọc từ stdin bằng cách bỏ tên file input.
+
+Output CSV đi kèm `.manifest.json` và `.progress.log`, với heartbeat mỗi mười giây khi chạy.
+Dùng `--format json` để lưu kết quả và metadata trong một file JSON. Nếu không truyền `--output`,
+artifact được tạo với tên riêng dưới `/tmp`; script không ghi đè artifact có sẵn. `--timeout` và
+`--delay` thay đổi giá trị mặc định năm giây và một giây. Không cần truyền target ID.
+
 ## Cách hoạt động
 
 1. Đọc file `--html`, hoặc kiểm tra cache khi dùng `--fetch`.
-2. Nếu cần tải, Playwright mở Chromium, điều hướng tới URL tìm kiếm và chờ DOM có dấu hiệu kết quả, không có kết quả hoặc redirect đăng ký. Thời gian chờ điều hướng và chờ DOM tối đa 20 giây cho mỗi bước.
-3. Theo dõi redirect và lưu DOM cùng metadata. Các lỗi xảy ra trước khi tạo được trang browser, như thiếu Chromium, chưa có DOM để lưu.
+2. Nếu cần tải, Playwright mở Chromium và điều hướng tới URL tìm kiếm. Script chờ kết quả, trạng thái không có kết quả, redirect đăng ký hoặc thử thách Cloudflare. Với chế độ headed, script tạm dừng để bạn xác nhận đã giải CAPTCHA, sau đó chờ kết quả mà không tải lại trang. Thời gian điều hướng và chờ DOM ban đầu tối đa 20 giây cho mỗi bước.
+3. Theo dõi redirect và lưu DOM cùng metadata. Nếu trang vẫn đang điều hướng lúc chụp HTML, script chờ ngắn để document hiện tại ổn định; nếu vẫn không chụp được, lỗi này được ghi riêng vào metadata và browser được đóng mà không che lỗi fetch ban đầu.
 4. BeautifulSoup parse HTML bằng `html.parser` có sẵn trong Python, theo cấu trúc dưới đây.
 5. Giữ và chuẩn hóa IPv4/IPv6 ở tiêu đề kết quả. Với tiêu đề hostname, chuyển thành chữ thường, bỏ dấu chấm cuối và chuyển tên Unicode sang IDNA. Loại giá trị không hợp lệ, áp dụng `--domain` nếu có, bỏ trùng và in mỗi IP hoặc hostname trên một dòng.
 
@@ -164,6 +207,7 @@ python fetch_censys.py --help
 
 - Chỉ đọc dữ liệu có trong trang HTML hiện tại; không bảo đảm lấy đủ toàn bộ kết quả tìm kiếm nhiều trang.
 - Không trích xuất certificate-only results, wildcard certificate names hay danh sách SAN.
-- Không thực hiện DNS lookup hoặc xác minh IP, hostname còn hoạt động.
+- `fetch_censys.py` không thực hiện DNS lookup hoặc xác minh IP, hostname còn hoạt động.
+- Validator chỉ kiểm tra HTTPS trên cổng 443. Certificate phù hợp và HTTP response không chứng minh đây là IP origin; địa chỉ có thể thuộc CDN hoặc hạ tầng dùng chung.
 - Không bảo đảm truy cập được khi Censys yêu cầu đăng nhập hoặc Cloudflare chặn browser.
 - Không tự cập nhật cache; dữ liệu có thể cũ cho tới khi chủ động refresh.

@@ -9,6 +9,8 @@ Requires beautifulsoup4; --fetch also requires playwright and its Chromium:
     python -m playwright install chromium
 No pagination or retries. Existing cached HTML is reused unless --refresh is set.
 Keeps IPv4/IPv6 titles instead of DNS aliases; hostname titles remain hostnames.
+With --headed, pauses for manual confirmation when a Cloudflare challenge appears.
+Use --chromium-path to select an installed Chromium executable.
 Excludes certificate/Matched Fields snippets, which can contain truncated text.
 """
 
@@ -16,6 +18,7 @@ import argparse
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -27,6 +30,36 @@ from bs4 import BeautifulSoup
 
 DEFAULT_QUERY = "example.com"
 IDENTIFIER_SELECTOR = 'h2 [data-testid="host-identifier-name"]'
+
+RESULT_OR_CHALLENGE_JS = """() => {
+    const title = (document.title || '').toLowerCase();
+    const body = (document.body?.innerText || '').slice(0, 4000).toLowerCase();
+    const challenge = title.includes('just a moment') ||
+      /performing security verification|checking your browser|verify you are human/.test(body) ||
+      !!document.querySelector('#challenge-form, #challenge-error-text, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]');
+    const ready = document.querySelector('h2 [data-testid="host-identifier-name"]') ||
+      document.querySelector('a[href^="/hosts/"] h2') ||
+      /Results:\\s*0\\b|No results found/i.test(document.body?.innerText || '');
+    const registration = location.hostname === 'accounts.censys.io' &&
+      location.pathname.replace(/\\/+$/, '') === '/register';
+    return challenge || ready || registration;
+}"""
+
+RESULT_OR_REGISTRATION_JS = """() =>
+    document.querySelector('h2 [data-testid="host-identifier-name"]') ||
+    document.querySelector('a[href^="/hosts/"] h2') ||
+    /Results:\\s*0\\b|No results found/i.test(document.body?.innerText || '') ||
+    (location.hostname === 'accounts.censys.io' &&
+      location.pathname.replace(/\\/+$/, '') === '/register')
+"""
+
+CLOUDFLARE_CHALLENGE_JS = """() => {
+    const title = (document.title || '').toLowerCase();
+    const body = (document.body?.innerText || '').slice(0, 4000).toLowerCase();
+    return title.includes('just a moment') ||
+      /performing security verification|checking your browser|verify you are human/.test(body) ||
+      !!document.querySelector('#challenge-form, #challenge-error-text, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]');
+}"""
 
 
 class CensysError(RuntimeError):
@@ -138,7 +171,14 @@ def parse_hostnames(html: str, *, final_url: str = "", domain: str | None = None
     return list(identifiers)
 
 
-def fetch_html(query: str, cache_dir: Path, *, refresh: bool = False, headed: bool = False) -> tuple[str, str]:
+def fetch_html(
+    query: str,
+    cache_dir: Path,
+    *,
+    refresh: bool = False,
+    headed: bool = False,
+    chromium_path: Path | None = None,
+) -> tuple[str, str]:
     """Navigate once with Playwright, cache the rendered DOM, never paginate."""
     source_url = "https://platform.censys.io/search?" + urlencode({"q": query})
     cache = cache_dir / hashlib.sha256(source_url.encode()).hexdigest()[:16]
@@ -152,19 +192,29 @@ def fetch_html(query: str, cache_dir: Path, *, refresh: bool = False, headed: bo
             raise CensysError(f"Cached fetch failed; inspect {cache} before explicitly using --refresh.")
         return html_path.read_text(encoding="utf-8"), metadata["final_url"]
 
-    from playwright.sync_api import Error as PlaywrightError, sync_playwright
+    from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     with sync_playwright() as playwright:
-        if not Path(playwright.chromium.executable_path).is_file():
+        executable_path = chromium_path.expanduser().resolve() if chromium_path else None
+        if executable_path is not None and (
+            not executable_path.is_file() or not os.access(executable_path, os.X_OK)
+        ):
+            raise CensysError(f"Chromium executable is missing or not executable: {executable_path}")
+        if executable_path is None and not Path(playwright.chromium.executable_path).is_file():
             raise CensysError(
-                "Playwright Chromium is missing. Run: python -m playwright install chromium"
+                "Playwright-managed browser is missing. Run: python -m playwright install chromium, "
+                "or pass --chromium-path with an installed Chromium executable."
             )
         try:
-            browser = playwright.chromium.launch(headless=not headed)
+            browser = playwright.chromium.launch(
+                headless=not headed,
+                executable_path=str(executable_path) if executable_path else None,
+            )
         except PlaywrightError as exc:
             raise CensysError(
-                "Could not start Chromium. Run: python -m playwright install chromium. "
+                "Could not start the browser. Check --chromium-path or run: "
+                "python -m playwright install chromium. "
                 "If using --headed, also check that a graphical display is available. "
                 f"Playwright details: {exc}"
             ) from exc
@@ -189,40 +239,95 @@ def fetch_html(query: str, cache_dir: Path, *, refresh: bool = False, headed: bo
                 check_redirect(request.url)
                 request = request.redirected_from
             check_redirect(page.url)
-            # DOM-only waiting: no reload, request replay, click or extra search.
-            page.wait_for_function(
-                """() => (location.hostname === 'accounts.censys.io' &&
-                    location.pathname.replace(/\\/+$/, '') === '/register') ||
-                    document.querySelector('h2 [data-testid="host-identifier-name"]') ||
-                    document.querySelector('a[href^="/hosts/"] h2') ||
-                    /Results:\\s*0\\b|No results found/i.test(document.body?.innerText || '')""",
-                timeout=20000,
-            )
+            # Wait for results or a challenge without replaying the search.
+            page.wait_for_function(RESULT_OR_CHALLENGE_JS, timeout=20000)
             check_redirect(page.url)
             if registration_seen:
                 raise CensysRegistrationRequired("Censys redirected to https://accounts.censys.io/register")
+            if page.evaluate(CLOUDFLARE_CHALLENGE_JS):
+                if not headed:
+                    raise CensysError(
+                        "Cloudflare verification is required. Re-run with --headed to solve it in Chromium."
+                    )
+                print(
+                    "Cloudflare verification detected. Solve the CAPTCHA in Chromium, "
+                    "then press Enter here. The search page will not be reloaded.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                try:
+                    input("Press Enter after the verification finishes: ")
+                except EOFError as exc:
+                    raise CensysError(
+                        "Manual CAPTCHA confirmation requires an interactive terminal."
+                    ) from exc
+                except KeyboardInterrupt as exc:
+                    raise CensysError("Manual CAPTCHA confirmation was interrupted.") from exc
+                check_redirect(page.url)
+                if registration_seen:
+                    raise CensysRegistrationRequired(
+                        "Censys redirected to https://accounts.censys.io/register"
+                    )
+                try:
+                    page.wait_for_function(RESULT_OR_REGISTRATION_JS, timeout=60000)
+                except PlaywrightTimeoutError as exc:
+                    if page.evaluate(CLOUDFLARE_CHALLENGE_JS):
+                        raise CensysError(
+                            "Cloudflare verification is still visible after confirmation; "
+                            "the results page did not load."
+                        ) from exc
+                    raise
+                check_redirect(page.url)
+                if registration_seen:
+                    raise CensysRegistrationRequired(
+                        "Censys redirected to https://accounts.censys.io/register"
+                    )
         except Exception as exc:
             error = exc
         finally:
             final_url = page.url
-            html = page.content()
-            html_path.write_text(html, encoding="utf-8")
-            html_path.chmod(0o600)
-            metadata_path.write_text(json.dumps({
-                "source_url": source_url,
-                "final_url": final_url,
-                "captured_at": datetime.now(timezone.utc).isoformat(),
-                "initial_http_status": response.status if response else None,
-                "error": type(error).__name__ if error else None,
-                "registration_redirect": bool(registration_seen) or isinstance(error, CensysRegistrationRequired),
-                "sha256": hashlib.sha256(html.encode()).hexdigest(),
-            }, indent=2), encoding="utf-8")
-            metadata_path.chmod(0o600)
-            browser.close()
-            print(f"Saved observation: {cache}", file=sys.stderr)
+            html = ""
+            capture_error = None
+            try:
+                try:
+                    html = page.content()
+                except PlaywrightError:
+                    # A result can become visible while the app is still navigating.
+                    # Wait locally for the current document; this does not reload the search.
+                    page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    html = page.content()
+            except PlaywrightError as exc:
+                capture_error = exc
+                if error is None:
+                    error = CensysError(
+                        "Could not capture the page because it was still navigating. "
+                        "The observation metadata was saved."
+                    )
+            try:
+                html_path.write_text(html, encoding="utf-8")
+                html_path.chmod(0o600)
+                metadata_path.write_text(json.dumps({
+                    "source_url": source_url,
+                    "final_url": final_url,
+                    "captured_at": datetime.now(timezone.utc).isoformat(),
+                    "initial_http_status": response.status if response else None,
+                    "error": type(error).__name__ if error else None,
+                    "observation_error": str(capture_error) if capture_error else None,
+                    "registration_redirect": bool(registration_seen) or isinstance(error, CensysRegistrationRequired),
+                    "sha256": hashlib.sha256(html.encode()).hexdigest(),
+                }, indent=2), encoding="utf-8")
+                metadata_path.chmod(0o600)
+            finally:
+                try:
+                    browser.close()
+                except PlaywrightError:
+                    pass
+                print(f"Saved observation: {cache}", file=sys.stderr)
         check_redirect(final_url)
         if registration_seen or isinstance(error, CensysRegistrationRequired):
             raise CensysRegistrationRequired("Censys redirected to https://accounts.censys.io/register") from error
+        if isinstance(error, CensysError):
+            raise error
         if error:
             raise CensysError(f"Search did not finish; inspect {cache}. No retry was made.") from error
         return html, final_url
@@ -238,15 +343,30 @@ def main() -> int:
     parser.add_argument("--final-url", default="", help="Final URL associated with --html (for redirect checks)")
     parser.add_argument("--cache-dir", type=Path, default=Path("/tmp/censys-search"))
     parser.add_argument("--refresh", action="store_true", help="Explicitly spend quota to replace a cached page")
-    parser.add_argument("--headed", action="store_true", help="Show Chromium when fetching")
+    parser.add_argument(
+        "--chromium-path",
+        type=Path,
+        help="Use this installed Chromium executable instead of Playwright's bundled browser",
+    )
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Show Chromium; wait for manual Cloudflare CAPTCHA confirmation if needed",
+    )
     args = parser.parse_args()
-    if args.html and (args.refresh or args.headed):
-        parser.error("--refresh and --headed require --fetch")
+    if args.html and (args.refresh or args.headed or args.chromium_path):
+        parser.error("--refresh, --headed, and --chromium-path require --fetch")
     try:
         if args.html:
             html, final_url = args.html.read_text(encoding="utf-8"), args.final_url
         else:
-            html, final_url = fetch_html(args.query, args.cache_dir, refresh=args.refresh, headed=args.headed)
+            html, final_url = fetch_html(
+                args.query,
+                args.cache_dir,
+                refresh=args.refresh,
+                headed=args.headed,
+                chromium_path=args.chromium_path,
+            )
         for identifier in parse_hostnames(html, final_url=final_url, domain=args.domain):
             print(identifier)
         return 0

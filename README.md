@@ -6,12 +6,15 @@ A Python script that uses **BeautifulSoup** to extract the IP addresses or hostn
 
 The script supports **Web Property** and **Host** results, keeps IPv4/IPv6 addresses when shown in the title, normalizes hostnames, and removes duplicates. It does not use the Censys API or require an API key. Search access remains subject to the permissions and quota Censys applies to the browser session.
 
+`validate_censys_ips.py` can then check candidate IP addresses against a hostname using HTTPS.
+
 ## Requirements and installation
 
 - Python **3.10 or newer**; checked with Python 3.12.
 - `beautifulsoup4`: required for both modes.
 - `playwright` and its matching Chromium browser: required when `--fetch` has no reusable cache.
 - `--headed` requires a graphical display, such as a Linux desktop or WSL with WSLg.
+- `validate_censys_ips.py` uses only the Python standard library; no additional packages are required.
 
 Clone the repository and create a virtual environment:
 
@@ -38,16 +41,21 @@ python -m pip install beautifulsoup4
 
 ```text
 $ python fetch_censys.py --help
-usage: fetch_censys.py [-h] (--html HTML | --fetch) [--query QUERY] [--domain DOMAIN]
-                       [--final-url FINAL_URL] [--cache-dir CACHE_DIR] [--refresh] [--headed]
+usage: fetch_censys.py [-h] (--html HTML | --fetch) [--query QUERY]
+                       [--domain DOMAIN] [--final-url FINAL_URL]
+                       [--cache-dir CACHE_DIR] [--refresh]
+                       [--chromium-path CHROMIUM_PATH] [--headed]
 
-Extract IPs or hostnames shown in Censys result titles (Web Properties and Hosts). Offline: python
-fetch_censys.py --html /tmp/saved.html Online: python fetch_censys.py --fetch --headed Requires
-beautifulsoup4; --fetch also requires playwright and its Chromium: python -m pip install
-beautifulsoup4 playwright python -m playwright install chromium No pagination or retries. Existing
-cached HTML is reused unless --refresh is set. Keeps IPv4/IPv6 titles instead of DNS aliases;
-hostname titles remain hostnames. Excludes certificate/Matched Fields snippets, which can contain
-truncated text.
+Extract IPs or hostnames shown in Censys result titles (Web Properties and
+Hosts). Offline: python fetch_censys.py --html /tmp/saved.html Online: python
+fetch_censys.py --fetch --headed Requires beautifulsoup4; --fetch also
+requires playwright and its Chromium: python -m pip install beautifulsoup4
+playwright python -m playwright install chromium No pagination or retries.
+Existing cached HTML is reused unless --refresh is set. Keeps IPv4/IPv6 titles
+instead of DNS aliases; hostname titles remain hostnames. With --headed,
+pauses for manual confirmation when a Cloudflare challenge appears. Use
+--chromium-path to select an installed Chromium executable. Excludes
+certificate/Matched Fields snippets, which can contain truncated text.
 
 options:
   -h, --help            show this help message and exit
@@ -59,7 +67,17 @@ options:
                         Final URL associated with --html (for redirect checks)
   --cache-dir CACHE_DIR
   --refresh             Explicitly spend quota to replace a cached page
-  --headed              Show Chromium when fetching
+  --chromium-path CHROMIUM_PATH
+                        Use this installed Chromium executable instead of
+                        Playwright's bundled browser
+  --headed              Show Chromium; wait for manual Cloudflare CAPTCHA
+                        confirmation if needed
+```
+
+The IP validator has its own manual:
+
+```bash
+python validate_censys_ips.py --help
 ```
 
 ### Quick start
@@ -76,6 +94,14 @@ Fetch one results page with a visible browser, or reuse its cache:
 python fetch_censys.py --fetch --headed --query 'example.com'
 ```
 
+If a Cloudflare challenge appears, solve it in Chromium, then press Enter in the terminal. The
+script waits for the results without reloading the page. Headless mode does not pause for manual
+verification.
+
+To select a separately installed Chromium executable, pass its path with `--chromium-path`, for
+example `--chromium-path /usr/bin/chromium`. Without this option, Playwright's bundled browser is
+used.
+
 Use a more specific Censys query by passing its text directly:
 
 ```bash
@@ -91,11 +117,30 @@ python fetch_censys.py --html /tmp/censys-results.html --domain example.com
 
 Cache defaults to `/tmp/censys-search`; use `--cache-dir` to change it. Add `--refresh` only when you intend to fetch again and potentially spend more quota. Omit `--headed` to run headless.
 
+Save candidate IPs one per line in `ips.txt`, then check whether they serve the chosen hostname:
+
+```bash
+python validate_censys_ips.py --domain example.com \
+  --output results/ip-validation.csv ips.txt
+```
+
+The validator connects to each IP on port 443, sets TLS SNI and HTTP Host to `--domain`, verifies
+the certificate, and sends one `HEAD /` request if TLS verification succeeds. It records the HTTP
+status, certificate names, server header, and redirect location without downloading the body or
+following redirects. Requests run serially with a one-second minimum gap by default; no retries
+are made. Invalid/non-global IPs are rejected and duplicates are ignored. Input can also come from
+stdin when the filename is omitted.
+
+CSV output includes a `.manifest.json` sidecar and a `.progress.log` with a heartbeat every ten
+seconds during the run. Use `--format json` for results and metadata in one JSON file. Without
+`--output`, unique artifacts are saved under `/tmp`. Existing artifacts are never overwritten.
+`--timeout` and `--delay` adjust the defaults of five seconds and one second. No target ID is required.
+
 ## How it works
 
 1. Read the `--html` file, or check the cache for `--fetch`.
-2. If a fetch is needed, Playwright launches Chromium, navigates to the search URL, and waits for results, a no-results indicator, or a registration redirect. Navigation and DOM readiness each have a 20-second timeout.
-3. Track redirects and save the DOM and metadata. Failures before a browser page is created, such as a missing Chromium installation, have no DOM to save.
+2. If a fetch is needed, Playwright launches Chromium and navigates to the search URL. It waits for results, a no-results indicator, a registration redirect, or a Cloudflare challenge. In headed mode, it pauses for manual CAPTCHA confirmation and then waits for results without reloading. Navigation and the initial DOM wait each have a 20-second timeout.
+3. Track redirects and save the DOM and metadata. If the page is navigating during capture, wait briefly for the current document; if capture still fails, record that separately in metadata and close the browser without masking the original fetch error.
 4. BeautifulSoup parses the HTML with Python's built-in `html.parser`, using the structures below.
 5. Keep and normalize IPv4/IPv6 addresses from result titles. For hostname titles, lowercase names, remove trailing dots, and convert Unicode names to IDNA. Reject invalid identifiers, apply `--domain` if supplied, remove duplicates, and print one IP or hostname per line.
 
@@ -164,6 +209,7 @@ python fetch_censys.py --help
 
 - Extracts only data present in the current HTML page; it does not retrieve every page of a search.
 - Does not extract certificate-only results, wildcard certificate names, or SAN lists.
-- Does not perform DNS lookups or verify that IP addresses or hostnames are still active.
+- `fetch_censys.py` does not perform DNS lookups or verify that IP addresses or hostnames are still active.
+- The IP validator checks only HTTPS on port 443. A matching certificate and HTTP response do not prove an origin IP; the address may be a CDN or shared edge.
 - Cannot guarantee access when Censys requires login or Cloudflare blocks the browser.
 - Does not refresh the cache automatically; results may remain stale until explicitly refreshed.
