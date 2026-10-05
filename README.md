@@ -6,7 +6,8 @@ A Python script that uses **BeautifulSoup** to extract the IP addresses or hostn
 
 The script supports **Web Property** and **Host** results, keeps IPv4/IPv6 addresses when shown in the title, normalizes hostnames, and removes duplicates. It does not use the Censys API or require an API key. Search access remains subject to the permissions and quota Censys applies to the browser session.
 
-`validate_censys_ips.py` can then check candidate IP addresses against a hostname using HTTPS.
+`validate_censys_ips.py` checks which candidate IPs serve the same HTTPS website as each hostname.
+It also supports explicit DNS-only comparison and the legacy single-host TLS/HEAD check.
 
 ## Requirements and installation
 
@@ -117,7 +118,62 @@ python fetch_censys.py --html /tmp/censys-results.html --domain example.com
 
 Cache defaults to `/tmp/censys-search`; use `--cache-dir` to change it. Add `--refresh` only when you intend to fetch again and potentially spend more quota. Omit `--headed` to run headless.
 
-Save candidate IPs one per line in `ips.txt`, then check whether they serve the chosen hostname:
+Save hostnames one per line in `hosts.txt` and candidate IPs one per line in `IP.txt`, then check
+which candidate IP serves the same HTTPS website as each hostname:
+
+```bash
+python validate_censys_ips.py --hosts hosts.txt --ips IP.txt \
+  --output results/valid_hosts.txt
+```
+
+The default output contains only confirmed pairs, in `/etc/hosts` syntax (`IP hostname`). An IP
+does not need to appear in current DNS. The script does not edit `/etc/hosts`. Use `--format csv`
+with a `.csv` output path for a simple two-column `ip,hostname` table instead.
+
+For each hostname, the script gets one public reference page using the system resolver (including
+existing hosts/NSS overrides), then connects directly to candidate IPs on port 443 with that
+hostname in TLS SNI and HTTP Host. A pair is confirmed only when trusted TLS hostname verification
+passes and the final successful response has matching page content. Comparisons use the complete
+bounded body or normalized visible text and application assets; a matching certificate, title,
+or HTTP 200 alone is insufficient. Content outside shared navigation/title must be substantive;
+empty JavaScript-only shells are left unverified. Inline application scripts must also agree for
+normalized-text matches, as must login/form destinations and field types. Short login pages can
+qualify through a real form/SSO structure, meaningful login text/title and application assets;
+complete destination queries are compared by hash, without saving raw values. Hidden input token
+values are not compared. Generic/default pages, challenges, errors, and truncated or
+weak responses are not promoted. At most two same-host HTTPS redirects are followed; redirects
+to another host, another port, or HTTP are not followed. Each response is capped at 256 KiB.
+
+Unresolvable, blocked, or otherwise unusable reference websites leave their candidate pairs
+**unverified**, not disproven. Changing content may also fail the conservative comparison. An
+empty output means no pairs were confirmed, not that every IP is invalid. Only HTTPS port 443 is
+checked, without login, cookies, retries, or Censys requests. Mapping confirms matching website
+responses, not exclusive ownership or proof that an IP is an origin rather than a shared edge.
+
+The `.details.json` file holds failed/unverified comparisons and reference diagnostics; the
+`.manifest.json` file summarizes the run. The primary output remains valid pairs only. Four
+workers share one global one-request-per-second budget by default. `--workers`, `--delay`, and
+`--timeout` adjust concurrency, the minimum request-start gap, and HTTPS request deadlines/socket
+timeouts. System DNS resolution itself follows OS timeouts. Ten-second
+heartbeats go to stderr and the append-only `.progress.log`. Interrupted runs preserve completed
+comparisons before waiting for outstanding workers and mark the manifest interrupted. Outstanding
+OS resolver calls may finish after interruption. Existing artifacts are never overwritten.
+
+To use the previous DNS comparison without connecting to candidate IPs, explicitly add
+`--dns-only`:
+
+```bash
+python validate_censys_ips.py --hosts hosts.txt --ips IP.txt --dns-only \
+  --output results/dns-resolution.csv
+```
+
+DNS-only CSV records current resolver addresses and `in_ip_list`, including addresses outside
+`IP.txt` and empty-IP rows for errors. It does not establish whether a candidate IP serves the
+website. Resolver caches, hosts/NSS settings, and OS timeouts apply; private IPs are accepted for
+DNS comparison only. Blank/comment lines are ignored and inputs are normalized and deduplicated.
+Individual CNAME records are not listed. `--timeout` does not apply to DNS-only mode.
+
+To check HTTPS for one hostname, the existing command remains available:
 
 ```bash
 python validate_censys_ips.py --domain example.com \
@@ -131,7 +187,7 @@ following redirects. Requests run serially with a one-second minimum gap by defa
 are made. Invalid/non-global IPs are rejected and duplicates are ignored. Input can also come from
 stdin when the filename is omitted.
 
-CSV output includes a `.manifest.json` sidecar and a `.progress.log` with a heartbeat every ten
+Legacy CSV output includes a `.manifest.json` sidecar and a `.progress.log` with a heartbeat every ten
 seconds during the run. Use `--format json` for results and metadata in one JSON file. Without
 `--output`, unique artifacts are saved under `/tmp`. Existing artifacts are never overwritten.
 `--timeout` and `--delay` adjust the defaults of five seconds and one second. No target ID is required.
@@ -210,6 +266,7 @@ python fetch_censys.py --help
 - Extracts only data present in the current HTML page; it does not retrieve every page of a search.
 - Does not extract certificate-only results, wildcard certificate names, or SAN lists.
 - `fetch_censys.py` does not perform DNS lookups or verify that IP addresses or hostnames are still active.
-- The IP validator checks only HTTPS on port 443. A matching certificate and HTTP response do not prove an origin IP; the address may be a CDN or shared edge.
+- DNS mode reports current system-resolver mappings, which may be cached or supplied by hosts/NSS configuration. DNS mappings do not prove IP ownership or origin hosting.
+- HTTPS mode checks only port 443. A matching certificate and HTTP response do not prove an origin IP; the address may be a CDN or shared edge.
 - Cannot guarantee access when Censys requires login or Cloudflare blocks the browser.
 - Does not refresh the cache automatically; results may remain stale until explicitly refreshed.

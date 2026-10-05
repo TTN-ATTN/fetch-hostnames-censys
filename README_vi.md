@@ -6,7 +6,8 @@ Script Python dùng **BeautifulSoup** để lấy IP hoặc hostname hiển th�
 
 Script hỗ trợ kết quả **Web Property** và **Host**, giữ IPv4/IPv6 khi tiêu đề hiển thị IP, chuẩn hóa hostname và bỏ trùng. Không dùng Censys API và không yêu cầu API key; khả năng tìm kiếm vẫn phụ thuộc quyền truy cập và quota mà Censys áp dụng cho phiên trình duyệt.
 
-`validate_censys_ips.py` giúp kiểm tra các IP ứng viên với một hostname qua HTTPS sau khi có kết quả.
+`validate_censys_ips.py` kiểm tra IP ứng viên nào phục vụ đúng website HTTPS của từng hostname.
+Script cũng hỗ trợ đối chiếu DNS-only khi chọn rõ và kiểm tra TLS/HEAD cho một hostname như trước.
 
 ## Requirements và cài đặt
 
@@ -116,7 +117,61 @@ python fetch_censys.py --html /tmp/censys-results.html --domain example.com
 
 Cache mặc định ở `/tmp/censys-search`; dùng `--cache-dir` để đổi vị trí. Chỉ thêm `--refresh` khi muốn tải lại và chấp nhận có thể tốn thêm quota. Bỏ `--headed` để chạy headless.
 
-Lưu mỗi IP ứng viên trên một dòng trong `ips.txt`, rồi kiểm tra chúng với hostname muốn xác minh:
+Lưu mỗi hostname trên một dòng trong `hosts.txt` và mỗi IP ứng viên trên một dòng trong `IP.txt`,
+rồi kiểm tra IP nào phục vụ đúng website của từng hostname:
+
+```bash
+python validate_censys_ips.py --hosts hosts.txt --ips IP.txt \
+  --output results/valid_hosts.txt
+```
+
+File chính mặc định **chỉ có cặp đã xác nhận**, dạng `IP hostname` như `/etc/hosts`. IP không cần
+trùng với DNS hiện tại. Script không sửa `/etc/hosts`. Nếu muốn bảng đơn giản hai cột
+`ip,hostname`, dùng `--format csv` và đặt output có đuôi `.csv`.
+
+Script lấy một trang tham chiếu cho mỗi hostname qua resolver hệ thống (có áp dụng hosts/NSS),
+rồi kết nối thẳng tới IP ứng viên trên cổng 443, giữ hostname trong TLS SNI và HTTP Host. Chỉ
+xác nhận khi kiểm tra certificate/hostname thành công và nội dung phản hồi cuối cùng khớp trang
+tham chiếu. Script đối chiếu toàn bộ body trong giới hạn, hoặc văn bản hiển thị đã chuẩn hóa
+kèm asset và script inline của ứng dụng; chỉ trùng certificate, title hoặc HTTP 200 thì chưa đủ.
+Nội dung chính ngoài menu/title phải đủ bằng chứng; khung ứng dụng JavaScript rỗng được để ở
+trạng thái chưa xác minh. Trang đăng nhập ngắn có thể đủ bằng chứng nếu có form/SSO thật,
+title/văn bản đăng nhập và asset ứng dụng phù hợp; không đối chiếu giá trị token ẩn. Đích của
+form/link đăng nhập (kể cả query, đối chiếu bằng hash không lưu giá trị thô) và loại trường cũng
+phải khớp. Trang mặc định,
+trang lỗi/CAPTCHA và phản hồi quá ngắn hoặc bị cắt đều không được đưa vào file valid. Script chỉ
+đi theo tối đa hai redirect HTTPS cùng hostname, không đi sang hostname khác, port khác hoặc HTTP.
+Mỗi phản hồi giới hạn 256 KiB.
+
+Hostname không resolve được, bị chặn hoặc không có trang tham chiếu đủ bằng chứng sẽ để các cặp
+IP ở trạng thái **chưa xác minh**, không kết luận IP sai. Nội dung thay đổi cũng có thể không
+vượt qua phép đối chiếu bảo thủ. File rỗng nghĩa là chưa xác nhận được cặp nào. Script chỉ kiểm
+tra HTTPS cổng 443, không đăng nhập, gửi cookie, retry hay search Censys. Kết quả khớp website
+không chứng minh quyền sở hữu độc quyền hoặc chắc chắn là server origin thay vì hạ tầng dùng chung.
+
+Lỗi và cặp chưa xác minh nằm riêng trong `.details.json`; `.manifest.json` chứa thống kê. File
+chính vẫn chỉ có các cặp valid. Mặc định bốn worker dùng chung giới hạn một request mỗi giây.
+`--workers`, `--delay`, `--timeout` lần lượt chỉnh concurrency, khoảng cách tối thiểu giữa các
+request và deadline/timeout HTTPS. Riêng DNS hệ thống vẫn theo timeout của hệ điều hành.
+Heartbeat mỗi mười giây được in ra stderr và ghi nối tiếp vào
+`.progress.log`. Nếu bị ngắt, script lưu các kết quả đã hoàn tất trước khi chờ worker và đánh dấu
+manifest interrupted. Lookup DNS đang chạy có thể kết thúc sau thời điểm bị ngắt.
+Không ghi đè artifact có sẵn.
+
+Nếu chỉ muốn đối chiếu DNS như phiên bản trước, thêm `--dns-only`:
+
+```bash
+python validate_censys_ips.py --hosts hosts.txt --ips IP.txt --dns-only \
+  --output results/dns-resolution.csv
+```
+
+CSV DNS-only ghi địa chỉ từ resolver và `in_ip_list`, kể cả IP ngoài danh sách và dòng IP trống
+khi lỗi. Chế độ này không xác minh IP có phục vụ website hay không. Cache, hosts/NSS và timeout
+của hệ điều hành được áp dụng; IP private chỉ được chấp nhận khi đối chiếu DNS. Dòng trống/comment
+bị bỏ qua, dữ liệu được chuẩn hóa và bỏ trùng. Không liệt kê từng CNAME; `--timeout` không dùng
+cho DNS-only.
+
+Lệnh kiểm tra HTTPS cho một hostname vẫn được giữ:
 
 ```bash
 python validate_censys_ips.py --domain example.com \
@@ -129,7 +184,7 @@ certificate, header server và địa chỉ redirect; không tải body hay đi 
 chạy tuần tự, mặc định cách nhau tối thiểu một giây và không retry. IP không hợp lệ hoặc không
 định tuyến toàn cầu bị loại; IP trùng bị bỏ qua. Có thể đọc từ stdin bằng cách bỏ tên file input.
 
-Output CSV đi kèm `.manifest.json` và `.progress.log`, với heartbeat mỗi mười giây khi chạy.
+Output CSV của chế độ cũ đi kèm `.manifest.json` và `.progress.log`, với heartbeat mỗi mười giây khi chạy.
 Dùng `--format json` để lưu kết quả và metadata trong một file JSON. Nếu không truyền `--output`,
 artifact được tạo với tên riêng dưới `/tmp`; script không ghi đè artifact có sẵn. `--timeout` và
 `--delay` thay đổi giá trị mặc định năm giây và một giây. Không cần truyền target ID.
@@ -208,6 +263,7 @@ python fetch_censys.py --help
 - Chỉ đọc dữ liệu có trong trang HTML hiện tại; không bảo đảm lấy đủ toàn bộ kết quả tìm kiếm nhiều trang.
 - Không trích xuất certificate-only results, wildcard certificate names hay danh sách SAN.
 - `fetch_censys.py` không thực hiện DNS lookup hoặc xác minh IP, hostname còn hoạt động.
-- Validator chỉ kiểm tra HTTPS trên cổng 443. Certificate phù hợp và HTTP response không chứng minh đây là IP origin; địa chỉ có thể thuộc CDN hoặc hạ tầng dùng chung.
+- Chế độ DNS ghi nhận ánh xạ hiện tại từ resolver hệ thống, có thể được cache hoặc lấy từ cấu hình hosts/NSS. Ánh xạ DNS không chứng minh quyền sở hữu IP hay IP origin.
+- Chế độ HTTPS chỉ kiểm tra cổng 443. Certificate phù hợp và HTTP response không chứng minh đây là IP origin; địa chỉ có thể thuộc CDN hoặc hạ tầng dùng chung.
 - Không bảo đảm truy cập được khi Censys yêu cầu đăng nhập hoặc Cloudflare chặn browser.
 - Không tự cập nhật cache; dữ liệu có thể cũ cho tới khi chủ động refresh.
